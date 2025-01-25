@@ -5,11 +5,16 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, PromptTemp
 from llama_index.core.embeddings import resolve_embed_model
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.agent import ReActAgent
-from prompts import context
+from pydantic import BaseModel
+from llama_index.core.output_parsers import PydanticOutputParser
+from llama_index.core.query_pipeline import QueryPipeline
+from prompts import context, code_parser_template
 from dotenv import load_dotenv
 import logging
 from retrying import retry
 from code_reader import code_reader
+import ast
+import os
 
 # Load environment variables
 load_dotenv()
@@ -54,11 +59,46 @@ tools = {
 # Create the ReAct agent
 agent = ReActAgent.from_tools(tools, llm=llm_code, verbose=True, context=context)
 
+
+class CodeOutput(BaseModel):
+    code: str
+    description: str
+    filename: str
+
+parser = PydanticOutputParser(CodeOutput)
+json_prompt_str = parser.format(code_parser_template)
+json_prompt_template = PromptTemplate(json_prompt_str)
+output_pipeline = QueryPipeline(chain=[json_prompt_template, llm])
+
+   
+
 # Main interaction loop
 while (prompt := input("Enter a prompt (q to quit): ")) != "q":
+    retries = 0
+
+    while retries < 3:
+        try:
+            result = agent.query(prompt)
+            next_result = output_pipeline.run(response=result)
+            cleaned_json = ast.literal_eval(str(next_result).replace("assistant:", ""))
+            break
+        except Exception as e:
+            retries += 1
+            print(f"Error occurred, retry #{retries}:", e)
+
+    if retries >= 3:
+        print("Unable to process request, try again...")
+        continue
+
+    print("Code generated")
+    print(cleaned_json["code"])
+    print("\n\nDescription:", cleaned_json["description"])
+
+    filename = cleaned_json["filename"]
+
     try:
-        result = query_with_retry(agent, prompt)  # Use retry logic
-        print(result)
-    except Exception as e:
-        logging.error(f"Error processing the prompt: {e}")
-        print("An error occurred. Please try again.")
+        with open(os.path.join("output", filename), "w") as f:
+            f.write(cleaned_json["code"])
+        print("Saved file", filename)
+    except:
+        print("Error saving file...")
